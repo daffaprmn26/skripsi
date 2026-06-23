@@ -1,0 +1,16 @@
+---
+- name: Test AWS access from AAP
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Get AWS caller identity
+      amazon.aws.aws_caller_info:
+      register: aws_identity
+
+    - name: Display AWS account information
+      ansible.builtin.debug:
+        msg:
+          - "AWS Account: {{ aws_identity.account }}"
+          - "Caller ARN: {{ aws_identity.arn }}"
+          - "User ID: {{ aws_identity.user_id }}"
