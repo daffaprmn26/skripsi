@@ -1,0 +1,114 @@
+---
+- name: Provision reusable AWS network for migration lab
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Get available Availability Zones
+      amazon.aws.aws_az_info:
+        region: "{{ aws_region }}"
+        filters:
+          state: available
+      register: az_info
+
+    - name: Ensure at least one Availability Zone is available
+      ansible.builtin.assert:
+        that:
+          - az_info.availability_zones | length > 0
+        fail_msg: "No available Availability Zone was found in {{ aws_region }}."
+
+    - name: Select the first available Availability Zone
+      ansible.builtin.set_fact:
+        selected_az: >-
+          {{
+            az_info.availability_zones
+            | map(attribute='zone_name')
+            | list
+            | sort
+            | first
+          }}
+
+    - name: Ensure VPC exists
+      amazon.aws.ec2_vpc_net:
+        name: "{{ project_name }}-vpc"
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ aws_region }}"
+        dns_support: true
+        dns_hostnames: true
+        tenancy: default
+        multi_ok: false
+        purge_tags: false
+        state: present
+        tags: >-
+          {{
+            common_tags
+            | combine({'Name': project_name ~ '-vpc'})
+          }}
+      register: vpc_result
+
+    - name: Ensure public subnet exists
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc_result.vpc.id }}"
+        cidr: "{{ public_subnet_cidr }}"
+        az: "{{ selected_az }}"
+        region: "{{ aws_region }}"
+        map_public: true
+        purge_tags: false
+        state: present
+        tags: >-
+          {{
+            common_tags
+            | combine({'Name': project_name ~ '-public-subnet'})
+          }}
+      register: subnet_result
+
+    - name: Ensure Internet Gateway exists
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ vpc_result.vpc.id }}"
+        region: "{{ aws_region }}"
+        purge_tags: false
+        state: present
+        tags: >-
+          {{
+            common_tags
+            | combine({'Name': project_name ~ '-igw'})
+          }}
+      register: igw_result
+
+    - name: Ensure public route table exists
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc_result.vpc.id }}"
+        region: "{{ aws_region }}"
+        purge_tags: false
+        state: present
+        subnets:
+          - "{{ subnet_result.subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw_result.gateway_id }}"
+        tags: >-
+          {{
+            common_tags
+            | combine({'Name': project_name ~ '-public-rt'})
+          }}
+      register: route_table_result
+
+    - name: Publish network information for workflow jobs
+      ansible.builtin.set_stats:
+        data:
+          lab_aws_region: "{{ aws_region }}"
+          lab_availability_zone: "{{ selected_az }}"
+          lab_vpc_id: "{{ vpc_result.vpc.id }}"
+          lab_public_subnet_id: "{{ subnet_result.subnet.id }}"
+          lab_internet_gateway_id: "{{ igw_result.gateway_id }}"
+          lab_route_table_id: "{{ route_table_result.route_table.id }}"
+
+    - name: Display provisioned network
+      ansible.builtin.debug:
+        msg:
+          - "Region: {{ aws_region }}"
+          - "Availability Zone: {{ selected_az }}"
+          - "VPC ID: {{ vpc_result.vpc.id }}"
+          - "Public subnet ID: {{ subnet_result.subnet.id }}"
+          - "Internet Gateway ID: {{ igw_result.gateway_id }}"
+          - "Route table ID: {{ route_table_result.route_table.id }}"
