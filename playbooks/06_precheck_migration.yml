@@ -1,0 +1,323 @@
+---
+- name: Discover CentOS source instance
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Find running CentOS source instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ centos_instance_name }}"
+          "tag:Role": "centos-source"
+          instance-state-name:
+            - running
+      register: centos_info
+
+    - name: Ensure exactly one CentOS source instance is running
+      ansible.builtin.assert:
+        that:
+          - centos_info.instances | length == 1
+          - centos_info.instances[0].public_ip_address is defined
+        fail_msg: >-
+          Expected exactly one running CentOS source instance
+          with a public IP, but found
+          {{ centos_info.instances | length }}.
+
+    - name: Add CentOS instance to temporary inventory
+      ansible.builtin.add_host:
+        name: "{{ centos_info.instances[0].public_ip_address }}"
+        groups:
+          - centos_dynamic
+        ansible_user: "{{ centos_ssh_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+
+    - name: Display discovered CentOS instance
+      ansible.builtin.debug:
+        msg:
+          - "Instance ID: {{ centos_info.instances[0].instance_id }}"
+          - "Public IP: {{ centos_info.instances[0].public_ip_address }}"
+          - "Private IP: {{ centos_info.instances[0].private_ip_address }}"
+
+- name: Run official and operational migration precheck
+  hosts: centos_dynamic
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Read CentOS release
+      ansible.builtin.command:
+        cmd: cat /etc/centos-release
+      register: centos_release
+      changed_when: false
+
+    - name: Check CentOS Stream package
+      ansible.builtin.command:
+        cmd: rpm -q centos-stream-release
+      register: centos_stream
+      changed_when: false
+      failed_when: false
+
+    - name: Check FIPS status
+      ansible.builtin.shell: |
+        if [ -f /proc/sys/crypto/fips_enabled ]; then
+          cat /proc/sys/crypto/fips_enabled
+        else
+          echo 0
+        fi
+      args:
+        executable: /bin/bash
+      register: fips_status
+      changed_when: false
+
+    - name: Check sos package
+      ansible.builtin.command:
+        cmd: rpm -q sos
+      register: sos_package
+      changed_when: false
+      failed_when: false
+
+    - name: Check CentOS Vault repository configuration
+      ansible.builtin.shell: |
+        grep -hsE \
+          '^[[:space:]]*baseurl=https?://vault\.centos\.org/' \
+          /etc/yum.repos.d/*.repo
+      args:
+        executable: /bin/bash
+      register: vault_repository
+      changed_when: false
+      failed_when: false
+
+    - name: Check enabled repositories
+      ansible.builtin.command:
+        cmd: yum -q repolist enabled
+      register: enabled_repositories
+      changed_when: false
+      failed_when: false
+
+    - name: Check available package updates
+      ansible.builtin.command:
+        cmd: yum -q check-update
+      register: package_updates
+      changed_when: false
+      failed_when: false
+
+    - name: Read root and var filesystem facts
+      ansible.builtin.set_fact:
+        root_mount: >-
+          {{
+            ansible_mounts
+            | selectattr('mount', 'equalto', '/')
+            | list
+            | first
+          }}
+        var_mount_candidates: >-
+          {{
+            ansible_mounts
+            | selectattr('mount', 'equalto', '/var')
+            | list
+          }}
+
+    - name: Select var filesystem or use root filesystem
+      ansible.builtin.set_fact:
+        var_mount: >-
+          {{
+            (var_mount_candidates | first)
+            if (var_mount_candidates | length > 0)
+            else root_mount
+          }}
+
+    - name: Calculate available storage
+      ansible.builtin.set_fact:
+        root_free_mb: >-
+          {{
+            (root_mount.size_available / 1024 / 1024)
+            | int
+          }}
+        var_free_mb: >-
+          {{
+            (var_mount.size_available / 1024 / 1024)
+            | int
+          }}
+
+    - name: Evaluate official validation rules
+      ansible.builtin.set_fact:
+        official_check_distribution: >-
+          {{ ansible_distribution == 'CentOS' }}
+
+        official_check_release: >-
+          {{
+            (centos_release.stdout | trim)
+            == migration_expected_release
+          }}
+
+        official_check_not_stream: >-
+          {{ centos_stream.rc != 0 }}
+
+        official_check_architecture: >-
+          {{ ansible_architecture == 'x86_64' }}
+
+        official_check_fips_disabled: >-
+          {{ (fips_status.stdout | trim) == '0' }}
+
+        official_check_vault_configured: >-
+          {{ vault_repository.rc == 0 }}
+
+        official_check_repository_usable: >-
+          {{
+            enabled_repositories.rc == 0
+            and 'repolist: 0' not in enabled_repositories.stdout
+          }}
+
+        official_check_packages_updated: >-
+          {{ package_updates.rc == 0 }}
+
+        official_check_update_command_valid: >-
+          {{ package_updates.rc in [0, 100] }}
+
+        official_check_sos_installed: >-
+          {{ sos_package.rc == 0 }}
+
+    - name: Build official validation failures
+      ansible.builtin.set_fact:
+        official_failures: >-
+          {{
+            []
+            + (
+                []
+                if official_check_distribution | bool
+                else ['Sistem operasi sumber bukan CentOS Linux']
+              )
+            + (
+                []
+                if official_check_release | bool
+                else ['Versi sumber bukan CentOS Linux 7.9.2009']
+              )
+            + (
+                []
+                if official_check_not_stream | bool
+                else ['CentOS Stream terdeteksi']
+              )
+            + (
+                []
+                if official_check_architecture | bool
+                else ['Arsitektur sistem bukan x86_64']
+              )
+            + (
+                []
+                if official_check_fips_disabled | bool
+                else ['FIPS mode masih aktif']
+              )
+            + (
+                []
+                if official_check_vault_configured | bool
+                else ['Repository CentOS 7 belum diarahkan ke CentOS Vault']
+              )
+            + (
+                []
+                if official_check_repository_usable | bool
+                else ['Repository CentOS tidak aktif atau tidak dapat digunakan']
+              )
+            + (
+                []
+                if official_check_update_command_valid | bool
+                else ['Pemeriksaan pembaruan package mengalami error']
+              )
+            + (
+                []
+                if package_updates.rc != 100
+                else ['Masih terdapat package CentOS yang belum diperbarui']
+              )
+            + (
+                []
+                if official_check_sos_installed | bool
+                else ['Package sos belum terpasang']
+              )
+          }}
+
+    - name: Build operational warnings
+      ansible.builtin.set_fact:
+        operational_warnings: >-
+          {{
+            []
+            + (
+                []
+                if (
+                  (ansible_memtotal_mb | int)
+                  >= (operational_min_memory_mb | int)
+                )
+                else [
+                  'Memory berada di bawah batas operasional penelitian'
+                ]
+              )
+            + (
+                []
+                if (
+                  (root_free_mb | int)
+                  >= (operational_min_root_free_mb | int)
+                )
+                else [
+                  'Ruang kosong filesystem / berada di bawah batas operasional'
+                ]
+              )
+            + (
+                []
+                if (
+                  (var_free_mb | int)
+                  >= (operational_min_var_free_mb | int)
+                )
+                else [
+                  'Ruang kosong filesystem /var berada di bawah batas operasional'
+                ]
+              )
+          }}
+
+    - name: Determine official stage-one eligibility
+      ansible.builtin.set_fact:
+        official_stage_one_passed: >-
+          {{ official_failures | length == 0 }}
+
+        operational_ready: >-
+          {{ operational_warnings | length == 0 }}
+
+    - name: Display official validation details
+      ansible.builtin.debug:
+        msg:
+          - "Distribution valid: {{ official_check_distribution }}"
+          - "Release valid: {{ official_check_release }}"
+          - "CentOS Stream absent: {{ official_check_not_stream }}"
+          - "Architecture valid: {{ official_check_architecture }}"
+          - "FIPS disabled: {{ official_check_fips_disabled }}"
+          - "Vault configured: {{ official_check_vault_configured }}"
+          - "Repository usable: {{ official_check_repository_usable }}"
+          - "Packages updated: {{ official_check_packages_updated }}"
+          - "SOS installed: {{ official_check_sos_installed }}"
+
+    - name: Display system and operational information
+      ansible.builtin.debug:
+        msg:
+          - "Release: {{ centos_release.stdout }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "Memory: {{ ansible_memtotal_mb }} MB"
+          - "Root free: {{ root_free_mb }} MB"
+          - "Var free: {{ var_free_mb }} MB"
+          - "Package update return code: {{ package_updates.rc }}"
+          - "Official stage-one passed: {{ official_stage_one_passed }}"
+          - "Official failures: {{ official_failures }}"
+          - "Operational ready: {{ operational_ready }}"
+          - "Operational warnings: {{ operational_warnings }}"
+
+    - name: Stop workflow when official stage-one precheck fails
+      ansible.builtin.assert:
+        that:
+          - official_stage_one_passed | bool
+        fail_msg: >-
+          Official stage-one migration precheck failed:
+          {{ official_failures | join('; ') }}
+        success_msg: >-
+          Official stage-one migration precheck passed.
+          Continue to Convert2RHEL preparation and
+          pre-conversion analysis.
