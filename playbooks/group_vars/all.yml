@@ -3,7 +3,7 @@
 # Ubah file ini jika region atau rancangan jaringan berubah.
 
 aws_region: us-east-2
-project_name: skripsi
+project_name: ansible
 
 vpc_cidr: 10.20.0.0/16
 public_subnet_cidr: 10.20.1.0/24
