@@ -8,6 +8,13 @@ project_name: ansible
 vpc_cidr: 10.20.0.0/16
 public_subnet_cidr: 10.20.1.0/24
 
+aws_key_name: "{{ project_name }}-key"
+security_group_name: "{{ project_name }}-security-group"
+
+# IP publik laptop yang diizinkan SSH langsung ke EC2.
+extra_ssh_allowed_cidrs:
+  - "36.69.88.215/32"
+
 common_tags:
   Project: "{{ project_name }}"
   ManagedBy: Ansible
