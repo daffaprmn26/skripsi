@@ -1,0 +1,160 @@
+---
+- name: Discover CentOS source instance
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Find running CentOS source instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ centos_instance_name }}"
+          "tag:Role": "centos-source"
+          instance-state-name:
+            - running
+      register: centos_info
+
+    - name: Ensure exactly one CentOS source is running
+      ansible.builtin.assert:
+        that:
+          - centos_info.instances | length == 1
+          - centos_info.instances[0].public_ip_address is defined
+        fail_msg: >-
+          Expected exactly one running CentOS source instance
+          with a public IP.
+
+    - name: Add CentOS instance to temporary inventory
+      ansible.builtin.add_host:
+        name: "{{ centos_info.instances[0].public_ip_address }}"
+        groups:
+          - centos_dynamic
+        ansible_user: "{{ centos_ssh_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+
+- name: Run migration precheck
+  hosts: centos_dynamic
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Read CentOS release
+      ansible.builtin.command:
+        cmd: cat /etc/centos-release
+      register: centos_release
+      changed_when: false
+
+    - name: Check CentOS Stream package
+      ansible.builtin.command:
+        cmd: rpm -q centos-stream-release
+      register: centos_stream
+      changed_when: false
+      failed_when: false
+
+    - name: Check enabled repositories
+      ansible.builtin.command:
+        cmd: yum -q repolist enabled
+      register: enabled_repositories
+      changed_when: false
+      failed_when: false
+
+    - name: Read root filesystem facts
+      ansible.builtin.set_fact:
+        root_mount: >-
+          {{
+            ansible_mounts
+            | selectattr('mount', 'equalto', '/')
+            | first
+          }}
+        var_mount: >-
+          {{
+            ansible_mounts
+            | selectattr('mount', 'equalto', '/var')
+            | first
+          }}
+
+    - name: Calculate available storage
+      ansible.builtin.set_fact:
+        root_free_mb: >-
+          {{ (root_mount.size_available / 1024 / 1024) | int }}
+        var_free_mb: >-
+          {{ (var_mount.size_available / 1024 / 1024) | int }}
+
+    - name: Build list of failed validations
+      ansible.builtin.set_fact:
+        precheck_failures: >-
+          {{
+            []
+            + (
+                []
+                if ansible_distribution == 'CentOS'
+                else ['Distribution bukan CentOS']
+              )
+            + (
+                []
+                if centos_release.stdout == migration_expected_release
+                else ['Versi CentOS bukan 7.9.2009']
+              )
+            + (
+                []
+                if centos_stream.rc != 0
+                else ['CentOS Stream terdeteksi']
+              )
+            + (
+                []
+                if ansible_architecture == 'x86_64'
+                else ['Arsitektur bukan x86_64']
+              )
+            + (
+                []
+                if (ansible_memtotal_mb | int) >=
+                   (migration_min_memory_mb | int)
+                else ['Memory tidak memenuhi minimum']
+              )
+            + (
+                []
+                if (root_free_mb | int) >=
+                   (migration_min_root_free_mb | int)
+                else ['Ruang kosong filesystem / tidak mencukupi']
+              )
+            + (
+                []
+                if (var_free_mb | int) >=
+                   (migration_min_var_free_mb | int)
+                else ['Ruang kosong filesystem /var tidak mencukupi']
+              )
+            + (
+                []
+                if enabled_repositories.rc == 0 and
+                   'repolist: 0' not in enabled_repositories.stdout
+                else ['Repository CentOS tidak dapat digunakan']
+              )
+          }}
+
+    - name: Determine migration eligibility
+      ansible.builtin.set_fact:
+        migration_eligible: "{{ precheck_failures | length == 0 }}"
+
+    - name: Display precheck result
+      ansible.builtin.debug:
+        msg:
+          - "Release: {{ centos_release.stdout }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "Memory: {{ ansible_memtotal_mb }} MB"
+          - "Root free: {{ root_free_mb }} MB"
+          - "Var free: {{ var_free_mb }} MB"
+          - "Migration eligible: {{ migration_eligible }}"
+          - "Failures: {{ precheck_failures }}"
+
+    - name: Stop workflow when precheck fails
+      ansible.builtin.assert:
+        that:
+          - migration_eligible | bool
+        fail_msg: >-
+          Migration precheck failed:
+          {{ precheck_failures | join('; ') }}
+        success_msg: >-
+          Migration precheck passed. Server is eligible
+          to continue to the conversion stage.
