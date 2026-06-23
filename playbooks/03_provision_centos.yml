@@ -1,0 +1,130 @@
+---
+- name: Provision CentOS source instance
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Find project VPC
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ project_name }}-vpc"
+          "tag:Project": "{{ project_name }}"
+      register: vpc_info
+
+    - name: Ensure exactly one VPC exists
+      ansible.builtin.assert:
+        that:
+          - vpc_info.vpcs | length == 1
+        fail_msg: >-
+          Expected one VPC named {{ project_name }}-vpc,
+          found {{ vpc_info.vpcs | length }}.
+
+    - name: Find public subnet
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ aws_region }}"
+        filters:
+          vpc-id: "{{ vpc_info.vpcs[0].vpc_id }}"
+          "tag:Name": "{{ project_name }}-public-subnet"
+      register: subnet_info
+
+    - name: Ensure exactly one public subnet exists
+      ansible.builtin.assert:
+        that:
+          - subnet_info.subnets | length == 1
+        fail_msg: >-
+          Expected one public subnet, found
+          {{ subnet_info.subnets | length }}.
+
+    - name: Find project security group
+      amazon.aws.ec2_security_group_info:
+        region: "{{ aws_region }}"
+        filters:
+          vpc-id: "{{ vpc_info.vpcs[0].vpc_id }}"
+          group-name: "{{ security_group_name }}"
+      register: security_group_info
+
+    - name: Ensure exactly one security group exists
+      ansible.builtin.assert:
+        that:
+          - security_group_info.security_groups | length == 1
+        fail_msg: >-
+          Expected one security group named {{ security_group_name }},
+          found {{ security_group_info.security_groups | length }}.
+
+    - name: Ensure one CentOS source instance is running
+      amazon.aws.ec2_instance:
+        name: "{{ centos_instance_name }}"
+        region: "{{ aws_region }}"
+        image_id: "{{ centos_ami_id }}"
+        instance_type: "{{ centos_instance_type }}"
+        key_name: "{{ aws_key_name }}"
+        vpc_subnet_id: "{{ subnet_info.subnets[0].subnet_id }}"
+        security_groups:
+          - "{{ security_group_info.security_groups[0].group_id }}"
+
+        network_interfaces:
+          - assign_public_ip: true
+
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_type: gp3
+              volume_size: "{{ centos_root_volume_size }}"
+              delete_on_termination: true
+
+        exact_count: 1
+        filters:
+          "tag:Name": "{{ centos_instance_name }}"
+          instance-state-name:
+            - pending
+            - running
+            - stopping
+            - stopped
+
+        state: running
+        wait: true
+        wait_timeout: 600
+
+        metadata_options:
+          http_endpoint: enabled
+          http_tokens: required
+
+        tags: >-
+          {{
+            common_tags
+            | combine({
+                'Name': centos_instance_name,
+                'Role': 'centos-source',
+                'MigrationSource': 'true'
+              })
+          }}
+      register: centos_instance_result
+
+    - name: Read CentOS instance information
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        instance_ids: "{{ centos_instance_result.instance_ids }}"
+      register: centos_instance_info
+
+    - name: Publish CentOS instance information
+      ansible.builtin.set_stats:
+        data:
+          centos_instance_id: >-
+            {{ centos_instance_info.instances[0].instance_id }}
+          centos_public_ip: >-
+            {{ centos_instance_info.instances[0].public_ip_address }}
+          centos_private_ip: >-
+            {{ centos_instance_info.instances[0].private_ip_address }}
+          centos_ssh_user: "{{ centos_ssh_user }}"
+
+    - name: Display CentOS instance information
+      ansible.builtin.debug:
+        msg:
+          - "Instance ID: {{ centos_instance_info.instances[0].instance_id }}"
+          - "AMI ID: {{ centos_instance_info.instances[0].image_id }}"
+          - "Instance type: {{ centos_instance_info.instances[0].instance_type }}"
+          - "Public IP: {{ centos_instance_info.instances[0].public_ip_address }}"
+          - "Private IP: {{ centos_instance_info.instances[0].private_ip_address }}"
+          - "SSH user: {{ centos_ssh_user }}"
+          - "Product codes: {{ centos_instance_info.instances[0].product_codes | default([]) }}"
