@@ -1,0 +1,68 @@
+---
+- name: Discover CentOS instance from AWS
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Find running CentOS source instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ centos_instance_name }}"
+          "tag:Role": "centos-source"
+          instance-state-name:
+            - running
+      register: centos_info
+
+    - name: Ensure exactly one CentOS instance is running
+      ansible.builtin.assert:
+        that:
+          - centos_info.instances | length == 1
+          - centos_info.instances[0].public_ip_address is defined
+        fail_msg: >-
+          Expected exactly one running CentOS source instance
+          with a public IP, found {{ centos_info.instances | length }}.
+
+    - name: Add CentOS instance to temporary inventory
+      ansible.builtin.add_host:
+        name: "{{ centos_info.instances[0].public_ip_address }}"
+        groups:
+          - centos_dynamic
+        ansible_user: "{{ centos_ssh_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+
+    - name: Display discovered host
+      ansible.builtin.debug:
+        msg:
+          - "Instance ID: {{ centos_info.instances[0].instance_id }}"
+          - "Public IP: {{ centos_info.instances[0].public_ip_address }}"
+          - "Private IP: {{ centos_info.instances[0].private_ip_address }}"
+
+- name: Test CentOS access and gather facts
+  hosts: centos_dynamic
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Test Ansible connection
+      ansible.builtin.ping:
+
+    - name: Read CentOS release
+      ansible.builtin.command:
+        cmd: cat /etc/centos-release
+      register: centos_release
+      changed_when: false
+
+    - name: Display server facts
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ ansible_hostname }}"
+          - "Distribution: {{ ansible_distribution }}"
+          - "Version: {{ ansible_distribution_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "Memory: {{ ansible_memtotal_mb }} MB"
+          - "Kernel: {{ ansible_kernel }}"
+          - "Release: {{ centos_release.stdout }}"

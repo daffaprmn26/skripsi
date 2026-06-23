@@ -30,3 +30,6 @@ common_tags:
   Project: "{{ project_name }}"
   ManagedBy: Ansible
   Environment: lab
+
+# Versi repository arsip CentOS Linux 7
+centos_vault_release: "7.9.2009"

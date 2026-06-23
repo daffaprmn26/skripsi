@@ -1,0 +1,155 @@
+---
+- name: Discover CentOS source instance
+  hosts: localhost-aws
+  gather_facts: false
+
+  tasks:
+    - name: Find running CentOS source instance
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ centos_instance_name }}"
+          "tag:Role": "centos-source"
+          instance-state-name:
+            - running
+      register: centos_info
+
+    - name: Ensure exactly one CentOS source instance is running
+      ansible.builtin.assert:
+        that:
+          - centos_info.instances | length == 1
+          - centos_info.instances[0].public_ip_address is defined
+        fail_msg: >-
+          Expected exactly one running CentOS source instance
+          with a public IP, but found
+          {{ centos_info.instances | length }}.
+
+    - name: Add CentOS instance to temporary inventory
+      ansible.builtin.add_host:
+        name: "{{ centos_info.instances[0].public_ip_address }}"
+        groups:
+          - centos_bootstrap
+        ansible_user: "{{ centos_ssh_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+
+    - name: Display discovered CentOS instance
+      ansible.builtin.debug:
+        msg:
+          - "Instance ID: {{ centos_info.instances[0].instance_id }}"
+          - "Public IP: {{ centos_info.instances[0].public_ip_address }}"
+          - "Private IP: {{ centos_info.instances[0].private_ip_address }}"
+
+
+- name: Bootstrap CentOS source instance
+  hosts: centos_bootstrap
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Read operating system release without Python
+      ansible.builtin.raw: cat /etc/centos-release
+      register: centos_release_raw
+      changed_when: false
+
+    - name: Validate supported CentOS release
+      ansible.builtin.assert:
+        that:
+          - >-
+            'CentOS Linux release 7.9.2009 (Core)'
+            in centos_release_raw.stdout
+        fail_msg: >-
+          Bootstrap stopped because the instance is not
+          CentOS Linux 7.9.2009.
+        success_msg: >-
+          Supported CentOS Linux 7.9.2009 source detected.
+
+    - name: Configure CentOS Vault repositories and install Python 3
+      ansible.builtin.raw: |
+        set -e
+
+        REPO_FILE="/etc/yum.repos.d/CentOS-Base.repo"
+        BACKUP_FILE="/etc/yum.repos.d/CentOS-Base.repo.backup"
+        TEMP_FILE="$(mktemp)"
+        CHANGED=0
+
+        cat > "${TEMP_FILE}" <<'REPO'
+        [base]
+        name=CentOS-7.9.2009 - Base
+        baseurl=https://vault.centos.org/7.9.2009/os/$basearch/
+        enabled=1
+        gpgcheck=1
+        gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+
+        [updates]
+        name=CentOS-7.9.2009 - Updates
+        baseurl=https://vault.centos.org/7.9.2009/updates/$basearch/
+        enabled=1
+        gpgcheck=1
+        gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+
+        [extras]
+        name=CentOS-7.9.2009 - Extras
+        baseurl=https://vault.centos.org/7.9.2009/extras/$basearch/
+        enabled=1
+        gpgcheck=1
+        gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+        REPO
+
+        if [ -f "${REPO_FILE}" ] && [ ! -f "${BACKUP_FILE}" ]; then
+          cp -a "${REPO_FILE}" "${BACKUP_FILE}"
+          CHANGED=1
+        fi
+
+        if [ ! -f "${REPO_FILE}" ] || \
+           ! cmp -s "${TEMP_FILE}" "${REPO_FILE}"; then
+          install -m 0644 "${TEMP_FILE}" "${REPO_FILE}"
+          CHANGED=1
+        fi
+
+        rm -f "${TEMP_FILE}"
+
+        if [ "${CHANGED}" -eq 1 ]; then
+          yum clean all
+          rm -rf /var/cache/yum
+          yum makecache
+        fi
+
+        if ! command -v python3 >/dev/null 2>&1; then
+          yum install -y python3
+          CHANGED=1
+        fi
+
+        if [ "${CHANGED}" -eq 1 ]; then
+          echo "BOOTSTRAP_CHANGED"
+        else
+          echo "BOOTSTRAP_OK"
+        fi
+      register: bootstrap_result
+      changed_when: "'BOOTSTRAP_CHANGED' in bootstrap_result.stdout"
+
+    - name: Gather facts after Python installation
+      ansible.builtin.setup:
+
+    - name: Validate enabled repositories
+      ansible.builtin.command:
+        cmd: yum -q repolist enabled
+      register: repository_result
+      changed_when: false
+
+    - name: Validate Python 3
+      ansible.builtin.command:
+        cmd: python3 --version
+      register: python_result
+      changed_when: false
+
+    - name: Display bootstrap result
+      ansible.builtin.debug:
+        msg:
+          - "Release: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "Python: {{ python_result.stdout }}"
+          - "Repository validation completed"
+          - "Bootstrap status: {{ bootstrap_result.stdout_lines | last }}"
